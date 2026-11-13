@@ -55,13 +55,23 @@ def notify(text, url=None):
         print("通知失敗：", e)
 
 
+def diag(r, raw):
+    """測試用：回報抓到的網頁長什麼樣子，方便判斷為什麼讀不到庫存"""
+    m = re.search(r"<title[^>]*>(.*?)</title>", raw, flags=re.S)
+    title = re.sub(r"\s+", " ", m.group(1)).strip()[:20] if m else "無"
+    return (f"H{r.status_code} L{len(raw)} T[{title}] "
+            f"a{raw.count('out of stock')} b{raw.count('out-of-stock')} "
+            f"c{raw.count('outofstock')} d{raw.count('in_stock')}")
+
+
 def check(url, baseline):
     """回傳 (狀態, 說明)。狀態 True=有貨, False=缺貨, None=無法判斷"""
     r = requests.get(url, headers=HEADERS, timeout=20)
     if r.status_code in (403, 429, 503):
         return None, f"被網站擋下 (HTTP {r.status_code})"
     r.raise_for_status()
-    html = r.text.lower()
+    raw = r.text.lower()
+    html = raw
 
     # 去掉程式碼與固定的限量公告，只看畫面上看得到的文字
     html = re.sub(r"<(script|style).*?</\1>", " ", html, flags=re.S)
@@ -71,6 +81,8 @@ def check(url, baseline):
     n_out = html.count(OUT)
     n_buy = sum(html.count(w) for w in BUY_WORDS)
     info = f"缺貨標籤={n_out}個, 購買按鈕字樣={n_buy}個"
+    if IS_TEST:
+        info += " | " + diag(r, raw)
 
     if "product" not in html and n_out == 0 and n_buy == 0:
         return None, "頁面內容不像商品頁（可能被擋或改版）；" + info
@@ -101,7 +113,8 @@ def main():
         if status is True:
             notify(f"🍵 有貨了！{name}\n趕快下單：{url}", url)
     if IS_TEST:
-        notify("測試結果 ✅\n" + "\n".join(lines))
+        notify("測試結果 ✅（H=狀態碼 L=頁面長度 T=標題 "
+               "a/b/c/d=原始碼內各關鍵字次數）\n" + "\n".join(lines))
 
 
 if __name__ == "__main__":
