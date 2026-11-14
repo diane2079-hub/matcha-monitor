@@ -1,137 +1,123 @@
 """
-抹茶庫存檢查（診斷版，不使用瀏覽器，速度快）
-通知頻道名稱從 GitHub Secret「NTFY_TOPIC」讀取，不要寫在這個檔案裡。
-
-這一版重點：把網頁裡的特殊空白（&nbsp;）和 HTML 符號還原後再找
-"Out of stock"，並在測試時回報網頁裡「stock / quantity」附近的原文，
-讓我們看清楚庫存資訊到底藏在哪裡。
+抹茶庫存 - 偵察版（只在手動按 Run workflow 時執行，只開第 1 款商品頁一次）
+目的：找出「庫存數字」和「Taiwan 選項」到底是從哪裡載入的。
+結果會分成 3 則通知傳到手機。
+通知頻道名稱從 GitHub Secret「NTFY_TOPIC」讀取。
 """
 import os
 import re
 import html as htmllib
-import time
-import random
 import requests
+from playwright.sync_api import sync_playwright
 
-# 名稱: (商品頁網址, 基準值)    基準值先填 None，測試後再填數字
-# 順序 = 檢查優先順序（越前面越先檢查）
-BASE = "https://www.marukyu-koyamaen.co.jp/english/shop/products/"
-PRODUCTS = {
-    "雲鶴 Unkaku":          (BASE + "1141020c1", None),
-    "金輪 Kinrin":          (BASE + "1151020c1", None),
-    "和光 Wako":            (BASE + "1161020c1", None),
-    "又玄 Yugen":           (BASE + "1171020c1", None),
-    "五十鈴 Isuzu":         (BASE + "1191040c1", None),
-    "青嵐 Aoarashi":        (BASE + "11a1040c1", None),
-    "極長安 Kiwami Choan":  (BASE + "1g36020c1", None),
-    "長安 Choan":           (BASE + "1121020c1", None),
-    "千木の白 Chigi no Shiro": (BASE + "1181040c1", None),
-}
-
-# ======== 以下不用改 ========
+URL = "https://www.marukyu-koyamaen.co.jp/english/shop/products/1141020c1"
 TOPIC = os.environ.get("NTFY_TOPIC", "")
 IS_TEST = os.environ.get("IS_TEST") == "true"
-
 OUT_RE = r"out\s*of\s*stock"
-BUY_WORDS = ["add to cart", "add to basket", "カートに入れる", "加入購物車"]
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                         "AppleWebKit/537.36 (KHTML, like Gecko) "
-                         "Chrome/124.0 Safari/537.36",
-           "Accept": "text/html,application/xhtml+xml",
-           "Accept-Language": "en-US,en;q=0.9,ja;q=0.8"}
-DEBUG_SNIPS = []
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+HEADERS = {"User-Agent": UA, "Accept": "text/html,application/xhtml+xml",
+           "Accept-Language": "en-US,en;q=0.9"}
 
 
-def notify(text, url=None):
+def notify(text):
     if not TOPIC:
-        print("沒有設定 NTFY_TOPIC，無法通知")
+        print("沒有設定 NTFY_TOPIC")
         return
-    headers = {"Priority": "high"}
-    if url:
-        headers["Click"] = url
+    data = text.encode("utf-8")[:3800].decode("utf-8", errors="ignore")
     try:
-        requests.post(f"https://ntfy.sh/{TOPIC}",
-                      data=text.encode("utf-8"), headers=headers, timeout=15)
+        requests.post(f"https://ntfy.sh/{TOPIC}", data=data.encode("utf-8"),
+                      headers={"Priority": "high"}, timeout=15)
     except Exception as e:
         print("通知失敗：", e)
 
 
-def clean(raw):
-    """還原 HTML 符號與特殊空白，回傳 (含程式碼的小寫全文, 只留畫面文字)"""
-    norm = htmllib.unescape(raw).replace("\xa0", " ").lower()
-    body = re.sub(r"<(script|style)[^>]*>.*?</\1>", " ", norm, flags=re.S)
-    text = re.sub(r"<[^>]+>", " ", body)
-    text = re.sub(r"\s+", " ", text)
-    text = re.sub(r"about limited availability.*?as soon as possible\.?",
-                  " ", text, flags=re.S)
-    return norm, text
+def static_scan():
+    """不開瀏覽器，直接掃描網頁原始碼裡的線索"""
+    r = requests.get(URL, headers=HEADERS, timeout=20)
+    raw = htmllib.unescape(r.text)
+    low = raw.lower()
+    msg = [f"【1/3 原始碼掃描】H{r.status_code} 長度{len(raw)}"]
+    hints = [k for k in ["wp-content", "woocommerce", "shopify", "__next",
+                         "nuxt", "react", "vue", "jquery", "alpine", "stripe"]
+             if k in low]
+    msg.append("框架線索：" + (",".join(hints) or "無"))
+    srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)', raw)[:8]
+    msg.append("script檔：\n" + "\n".join(s[-70:] for s in srcs))
+    calls = re.findall(r"(?:fetch\(|axios\.\w+\(|\$\.(?:ajax|get|post|getJSON)\("
+                       r"|\.open\(['\"](?:GET|POST)['\"],)\s*[^;)]{0,100}", raw)[:6]
+    msg.append("程式內的網路呼叫：\n" + ("\n".join(c[:110] for c in calls) or "無"))
+    paths = sorted(set(re.findall(
+        r"""["'](/[A-Za-z0-9_\-/\.]*(?:api|ajax|json|stock|inventory|shipping|"""
+        r"""country|cart)[A-Za-z0-9_\-/\.\?=&%]*)["']""", raw)))[:10]
+    msg.append("可疑路徑：\n" + ("\n".join(paths) or "無"))
+    notify("\n".join(msg))
 
 
-def snippets(norm, text):
-    """測試用：擷取 stock / quantity 附近的原文"""
-    out = []
-    for m in list(re.finditer(r"stock", text))[:3]:
-        out.append("文字:" + text[max(0, m.start() - 50): m.end() + 50])
-    for m in list(re.finditer(r"<input[^>]{0,160}(?:quantity|qty)[^>]{0,160}>",
-                              norm))[:2]:
-        out.append("輸入框:" + m.group(0)[:220])
-    for m in list(re.finditer(r"[^<>]{0,60}(?:out\s*of\s*stock|sold\s*out)"
-                              r"[^<>]{0,40}", norm))[:2]:
-        out.append("原碼:" + m.group(0).strip()[:120])
-    return out
+def browser_scan():
+    """用瀏覽器開一次頁面，記錄它在背景叫了哪些資料"""
+    xhrs = []
+    with sync_playwright() as p:
+        b = p.chromium.launch(args=["--no-sandbox"])
+        ctx = b.new_context(user_agent=UA, locale="en-US",
+                            viewport={"width": 1280, "height": 900})
+        page = ctx.new_page()
 
+        def on_resp(resp):
+            try:
+                if resp.request.resource_type in ("xhr", "fetch"):
+                    xhrs.append(resp)
+            except Exception:
+                pass
 
-def check(url, baseline, first=False):
-    """回傳 (狀態, 說明)。狀態 True=有貨, False=缺貨, None=無法判斷"""
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    if r.status_code in (403, 429, 503):
-        return None, f"被網站擋下 (HTTP {r.status_code})"
-    r.raise_for_status()
-    norm, text = clean(r.text)
+        page.on("response", on_resp)
+        resp = page.goto(URL, wait_until="domcontentloaded", timeout=45000)
+        status = resp.status if resp else 0
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            pass
+        page.wait_for_timeout(3000)
 
-    n_out = len(re.findall(OUT_RE, text))
-    n_out_all = len(re.findall(OUT_RE, norm))
-    n_buy = sum(text.count(w) for w in BUY_WORDS)
-    n_tw = norm.count("taiwan")
-    info = f"缺貨字樣={n_out}個, 購買字樣={n_buy}個"
-    if IS_TEST:
-        info += f" | H{r.status_code} L{len(r.text)} 含程式碼缺貨={n_out_all} 台灣={n_tw}"
-        if first:
-            DEBUG_SNIPS.extend(snippets(norm, text))
+        text = page.inner_text("body").replace("\xa0", " ").lower()
+        n_out = len(re.findall(OUT_RE, text))
+        n_tw = text.count("taiwan")
+        snips = [text[max(0, m.start() - 40): m.end() + 40]
+                 for m in list(re.finditer(r"stock", text))[:3]]
+        try:
+            inputs = page.eval_on_selector_all(
+                "input, select",
+                "els => els.slice(0,14).map(e => [e.tagName, e.name||'', "
+                "e.type||'', e.max||'', e.value||''].join('/'))")
+        except Exception:
+            inputs = []
+        notify(f"【2/3 瀏覽器看到的畫面】H{status} 文字長{len(text)} "
+               f"缺貨字樣={n_out} 台灣={n_tw}\n輸入欄：{inputs}\n"
+               f"stock附近：{snips}")
 
-    if len(text) < 200:
-        return None, "頁面幾乎沒有內容（可能被擋）；" + info
-    if baseline is not None:
-        if n_out < baseline:
-            return True, f"缺貨字樣減少了！{info}（基準{baseline}）"
-        return False, f"全部缺貨；{info}（基準{baseline}）"
-    if n_buy > 0:
-        return True, "（未設基準，暫以有購買字樣判斷）" + info
-    if n_out > 0:
-        return False, "（未設基準）" + info
-    return None, "看不出庫存狀態；" + info
+        lines = []
+        for r in xhrs[:10]:
+            try:
+                body = r.text()
+            except Exception:
+                body = ""
+            has = "stock" in body.lower() or "taiwan" in body.lower()
+            lines.append(f"{r.status} {r.url[-95:]}\n   含stock/taiwan={'是' if has else '否'}"
+                         f" 開頭:{body[:70].strip()!r}")
+        notify(f"【3/3 背景資料請求】共{len(xhrs)}個\n" +
+               ("\n".join(lines) or "沒有任何背景請求"))
+        b.close()
 
 
 def main():
-    lines = []
-    for i, (name, (url, baseline)) in enumerate(PRODUCTS.items()):
-        if i > 0:
-            time.sleep(random.uniform(2, 5))
+    if not IS_TEST:
+        print("偵察版：只有手動執行才會運作")
+        return
+    for fn in (static_scan, browser_scan):
         try:
-            status, why = check(url, baseline, first=(i == 0))
+            fn()
         except Exception as e:
-            status, why = None, f"讀取失敗 ({str(e)[:80]})"
-        label = {True: "有貨！", False: "缺貨", None: "無法判斷"}[status]
-        print(f"{name}: {label} - {why}")
-        lines.append(f"{name}: {label}\n  {why}")
-        if status is True:
-            notify(f"🍵 有貨了！{name}\n趕快下單：{url}", url)
-    if IS_TEST:
-        notify("測試結果 ✅（診斷版）\n" + "\n".join(lines))
-        if DEBUG_SNIPS:
-            notify("第1款網頁原文片段：\n" + "\n".join(DEBUG_SNIPS))
-        else:
-            notify("第1款網頁原文片段：找不到 stock 或數量輸入框相關文字")
+            notify(f"{fn.__name__} 失敗：{str(e)[:300]}")
 
 
 if __name__ == "__main__":
